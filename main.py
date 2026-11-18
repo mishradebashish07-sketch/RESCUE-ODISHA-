@@ -1,22 +1,27 @@
+import ssl
 import uuid
-import datetime
-import urllib.parse
 from typing import Optional
 from fastapi import FastAPI, Depends, status
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker, Session
 
-# --- DATABASE SETUP (MySQL) ---
-MYSQL_USER = "root"
-MYSQL_PASSWORD = urllib.parse.quote_plus("Mishra@2009")
-MYSQL_HOST = "localhost"
-MYSQL_PORT = "3306"
-MYSQL_DB = "disaster_db"
+# --- DATABASE SETUP (Aiven Cloud MySQL) ---
+DATABASE_URL = (
+    "mysql+pymysql://avnadmin:AVNS_jjLgFjzUZjJ_o9W6jHh@"
+    "mysql-ded093-mishradebashish07-9af6.f.aivencloud.com:13345/defaultdb"
+)
 
-DATABASE_URL = f"mysql+pymysql://{MYSQL_USER}:{MYSQL_PASSWORD}@{MYSQL_HOST}:{MYSQL_PORT}/{MYSQL_DB}"
+# SSL configuration required for Aiven MySQL with PyMySQL
+ssl_ctx = ssl.create_default_context()
+ssl_ctx.check_hostname = False
+ssl_ctx.verify_mode = ssl.CERT_NONE
 
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+engine = create_engine(
+    DATABASE_URL,
+    connect_args={"ssl": ssl_ctx},
+    pool_pre_ping=True
+)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 def get_db():
@@ -25,6 +30,64 @@ def get_db():
         yield db
     finally:
         db.close()
+
+# --- AUTO-CREATE TABLES & SEED DATA ON STARTUP ---
+def init_db():
+    with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS shelters (
+                id VARCHAR(36) PRIMARY KEY,
+                name VARCHAR(255) NOT NULL,
+                contact_phone VARCHAR(50),
+                total_capacity INT DEFAULT 500,
+                current_occupancy INT DEFAULT 0,
+                location POINT NOT NULL SRID 4326
+            );
+        """))
+
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS responder_units (
+                id VARCHAR(36) PRIMARY KEY,
+                team_name VARCHAR(255) NOT NULL,
+                team_type VARCHAR(100),
+                is_available BOOLEAN DEFAULT TRUE,
+                location POINT NOT NULL SRID 4326
+            );
+        """))
+
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS distress_reports (
+                id VARCHAR(36) PRIMARY KEY,
+                reporter_contact VARCHAR(50),
+                raw_message TEXT,
+                category VARCHAR(100),
+                severity_score INT,
+                location POINT NOT NULL SRID 4326,
+                status VARCHAR(50),
+                assigned_responder_id VARCHAR(36),
+                nearest_shelter_id VARCHAR(36),
+                created_at DATETIME
+            );
+        """))
+
+        # Seed Shelters if table is empty
+        shelter_count = conn.execute(text("SELECT COUNT(*) FROM shelters")).scalar()
+        if shelter_count == 0:
+            conn.execute(text("""
+                INSERT INTO shelters (id, name, contact_phone, total_capacity, current_occupancy, location) VALUES
+                ('sh-1', 'Chandipur Cyclone Shelter (Baleswar)', '+91-6782-270001', 500, 50, ST_PointFromText('POINT(87.0130 21.4680)', 4326)),
+                ('sh-2', 'Barabati Multipurpose Shelter (Cuttack)', '+91-671-2300002', 600, 80, ST_PointFromText('POINT(85.8732 20.4812)', 4326)),
+                ('sh-3', 'Chhatrapur Relief Camp (Ganjam)', '+91-6811-263003', 450, 40, ST_PointFromText('POINT(84.9920 19.3550)', 4326));
+            """))
+
+        # Seed ODRAF Units if table is empty
+        unit_count = conn.execute(text("SELECT COUNT(*) FROM responder_units")).scalar()
+        if unit_count == 0:
+            conn.execute(text("""
+                INSERT INTO responder_units (id, team_name, team_type, is_available, location) VALUES
+                ('odraf-3', 'ODRAF Unit 3 (Inflatable Boat Team)', 'Flood Rescue', TRUE, ST_PointFromText('POINT(86.9100 21.4800)', 4326)),
+                ('odraf-1', 'ODRAF Unit 1 (Bhubaneswar Rapid Action)', 'Rapid Response', TRUE, ST_PointFromText('POINT(85.8200 20.2961)', 4326));
+            """))
 
 # --- PYDANTIC SCHEMAS ---
 class SOSRequest(BaseModel):
@@ -44,17 +107,20 @@ class TriageResponse(BaseModel):
 # --- FASTAPI APP ---
 app = FastAPI(title="Innovate Odisha - AI Disaster Response API (MySQL)")
 
+@app.on_event("startup")
+def on_startup():
+    init_db()
+
 @app.get("/")
 def health_check():
     return {"status": "online", "message": "Odisha Disaster Management API is running"}
 
 @app.post("/api/v1/sos/triage", response_model=TriageResponse, status_code=status.HTTP_201_CREATED)
 def handle_sos_report(payload: SOSRequest, db: Session = Depends(get_db)):
-    # Spatial Point format: POINT(lon lat)
     sos_wkt = f"POINT({payload.longitude} {payload.latitude})"
     report_id = str(uuid.uuid4())
 
-    # 1. Spatial Query: Closest shelter with available capacity using ST_Distance_Sphere (returns meters)
+    # 1. Spatial Query: Closest shelter with available capacity
     shelter_query = text("""
         SELECT id, name, contact_phone, 
                ST_Distance_Sphere(location, ST_PointFromText(:sos_point, 4326)) AS distance_meters
@@ -111,7 +177,6 @@ def handle_sos_report(payload: SOSRequest, db: Session = Depends(get_db)):
 
     db.commit()
 
-    # Format return JSON
     shelter_info = None
     if nearest_shelter:
         shelter_info = {
