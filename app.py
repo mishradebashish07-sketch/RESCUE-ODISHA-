@@ -68,7 +68,7 @@ lat = st.sidebar.number_input("Latitude", value=default_lat, format="%.4f")
 lon = st.sidebar.number_input("Longitude", value=default_lon, format="%.4f")
 
 # --- LIVE RENDER BACKEND URL ---
-API_BASE = "https://rescue-odisha.onrender.com/api/v1"
+API_BASE = "https://rescue-odisha.onrender.com"
 
 # Known units and coordinates
 odraf_units = [
